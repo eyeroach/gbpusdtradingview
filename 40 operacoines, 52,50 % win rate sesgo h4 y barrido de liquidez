@@ -1,0 +1,431 @@
+//@version=5
+strategy("Estrategia SMC de Alta Probabilidad v6.7 (Visual)", overlay=true, initial_capital=200000, default_qty_type=strategy.cash)
+max_bars_back(time, 5000)
+
+// ====================================================================================================================================================================================
+// ||                                                                                                                                                                                  ||
+// || MÓDULO 1: ENTRADAS (INPUTS)                                                                                ||
+// ||                                                                                                                                                                                  ||
+// ====================================================================================================================================================================================
+
+// --- Inputs Generales ---
+instrument = input.symbol("", "Instrumento (en este gráfico)")
+
+// --- Inputs para Visualización ---
+string visuals_group = "1. Visualización"
+bool show_live_visuals = input.bool(true, "Activar Modo en Tiempo Real?", group=visuals_group, tooltip="Si se activa, se mostrarán las líneas (solo en M1) y la tabla (en todas las TFs) de la operación pendiente.")
+string style_title = "Estilos de Líneas"
+string line_style_entry_str = input.string("Discontinuo", "Estilo Línea Entrada", options=["Sólido", "Discontinuo", "Punteado"], group = visuals_group, inline="L1", title=style_title)
+color line_color_entry = input.color(color.new(color.blue, 0), "", group=visuals_group, inline="L1")
+string line_style_sl_str = input.string("Discontinuo", "Estilo Línea SL", options=["Sólido", "Discontinuo", "Punteado"], group = visuals_group, inline="L2")
+color line_color_sl = input.color(color.new(color.red, 0), "", group=visuals_group, inline="L2")
+string line_style_tp_str = input.string("Discontinuo", "Estilo Línea TP", options=["Sólido", "Discontinuo", "Punteado"], group = visuals_group, inline="L3")
+color line_color_tp = input.color(color.new(color.green, 0), "", group=visuals_group, inline="L3")
+int line_width = input.int(3, "Grosor de Líneas", minval=1, maxval=5, group=visuals_group)
+int line_length_bars = input.int(50, "Longitud de Líneas (en barras)", minval=1, group=visuals_group)
+
+// --- Inputs de Configuración Principal ---
+string main_config_group = "3. Configuración Principal"
+string choch_timeframe = input.string("M1", "Temporalidad del CHOCH", options=["M1", "M5"], group = main_config_group)
+string entry_type = input.string("FVG", "Tipo de Entrada", options=["Fibonacci", "FVG"], group = main_config_group, tooltip="Fibonacci: Usa el retroceso de Fibonacci para la entrada.\nFVG: Busca una ineficiencia (Fair Value Gap) para una entrada de mayor precisión.")
+int choch_lookback_bars = input.int(2, "CHOCH Lookback Bars", minval=2, group=main_config_group)
+int choch_waiting_bars = input.int(10, "Velas de Espera para CHOCH", group=main_config_group)
+float fib_retracement_level = input.float(0.38, "Nivel de Retroceso Fibonacci para Entrada", minval=0, maxval=1, step=0.01, group=main_config_group)
+string trend_timeframe_input = input.string("H1", "Temporalidad de Tendencia Principal", options=["H1", "M30"], group = main_config_group)
+int liquidity_lookback = input.int(20, "Velas para Barrido de Liquidez", minval=3, group=main_config_group, tooltip="Número de velas hacia atrás para identificar un máximo/mínimo que será barrido antes de considerar una entrada.")
+// --> INTERRUPTOR AÑADIDO
+bool use_liquidity_sweep_filter = input.bool(true, "Activar Filtro de Barrido de Liquidez?", group=main_config_group)
+
+
+// --- Inputs para Filtro de Alineación de Tendencia (MTF) ---
+string trend_filter_group = "4. Filtro de Tendencia (MTF Alignment)"
+bool use_mtf_alignment_filter = input.bool(true, "Activar Filtro de Alineación MTF?", group=trend_filter_group)
+int min_trend_score = input.int(2, "Puntaje Mínimo de Tendencia", minval=1, maxval=4, group=trend_filter_group, tooltip="H1=2pts, M15=1pt, M5=1pt. El total debe ser >= a este valor para operar.")
+
+// --- Inputs para Filtro de Sesgo Estructural (H4) ---
+string h4_bias_filter_group = "5. Filtro de Sesgo Estructural (H4)"
+bool use_h4_structural_bias = input.bool(false, "Activar Filtro de Sesgo Estructural?", group=h4_bias_filter_group, tooltip="Si se activa, la estrategia solo buscará compras si la estructura de H4 es alcista, y solo ventas si es bajista.")
+
+// --- Inputs para Selección de Temporalidades de OB ---
+string ob_timeframes_group = "2. Temporalidades de OB a Evaluar"
+bool use_h1_ob = input.bool(true, "Usar OB de H1", group=ob_timeframes_group)
+bool use_m30_ob = input.bool(true, "Usar OB de M30", group=ob_timeframes_group)
+bool use_m20_ob = input.bool(true, "Usar OB de M20", group=ob_timeframes_group)
+bool use_m15_ob = input.bool(true, "Usar OB de M15", group=ob_timeframes_group)
+bool use_m10_ob = input.bool(true, "Usar OB de M10", group=ob_timeframes_group)
+bool use_m5_ob = input.bool(true, "Usar OB de M5", group=ob_timeframes_group)
+bool use_m3_ob = input.bool(true, "Usar OB de M3", group=ob_timeframes_group)
+
+// --- Inputs para Filtros de Calidad de OB ---
+string ob_quality_group = "10. Filtro de Calidad de OB (Tipo)"
+string ob_quality_filter = input.string("Ambos", "Tipo de OB a Operar", options=["Ambos", "Solo Extremos", "Solo Decisionales"], group=ob_quality_group)
+
+// --- Inputs para Gestión de Riesgo ---
+string risk_group = "6. Gestión de Riesgo"
+float risk_reward_ratio = input.float(2.0, "Ratio Riesgo/Beneficio", minval=0.1, step=0.1, group=risk_group)
+float risk_per_trade_perc = input.float(0.5, "Riesgo por Operación (%)", minval=0.01, maxval=100, step=0.01, group=risk_group)
+
+// --- Inputs para Filtro Horario y de Días ---
+string time_filter_group = "5. Filtro Horario y de Días"
+string time_session = input.session("0400-1200", "Horario de Operación (HHMM-HHMM)", group=time_filter_group, tooltip="Horario de Argentina (GMT-3)")
+bool trade_monday = input.bool(true, "Lunes", group=time_filter_group, inline="days")
+bool trade_tuesday = input.bool(true, "Martes", group=time_filter_group, inline="days")
+bool trade_wednesday = input.bool(true, "Miércoles", group=time_filter_group, inline="days")
+bool trade_thursday = input.bool(true, "Jueves", group=time_filter_group, inline="days")
+bool trade_friday = input.bool(true, "Viernes", group=time_filter_group, inline="days")
+bool avoid_first_friday = input.bool(true, "No operar primer viernes del mes (NFP)?", group=time_filter_group)
+
+
+// ====================================================================================================================================================================================
+// ||                                                                                                                                                                                  ||
+// || MÓDULO 2: TIPOS Y FUNCIONES AUXILIARES                                                                             ||
+// ||                                                                                                                                                                                  ||
+// ====================================================================================================================================================================================
+
+type OrderBlockData
+    float ob_open
+    float ob_high
+    float ob_low
+    float ob_close
+    bool is_bullish
+    string timeframe_name
+    int bar_index_created
+
+get_ohlc(res, sym) => request.security(sym, res, [open, high, low, close], lookahead=barmerge.lookahead_off)
+f_is_within_time() => not na(time(timeframe.period, time_session, "America/Argentina/Buenos_Aires"))
+f_is_bullish_ob(o, c) => c < o
+f_is_bearish_ob(o, c) => c > o
+
+f_get_ob_type(ob_is_bullish, ob_low, ob_high, swing_h, swing_l) =>
+    ob_type = "WEAK"
+    swing_range = swing_h - swing_l
+    if swing_range > 0 and not na(swing_h) and not na(swing_l)
+        float decisional_bullish_top = swing_h - swing_range * 0.382
+        float decisional_bullish_bottom = swing_h - swing_range * 0.618
+        float extreme_bullish_level = swing_h - swing_range * 0.786
+        float decisional_bearish_top = swing_l + swing_range * 0.618
+        float decisional_bearish_bottom = swing_l + swing_range * 0.382
+        float extreme_bearish_level = swing_l + swing_range * 0.786
+        if ob_is_bullish
+            if ob_low <= extreme_bullish_level
+                ob_type := "EXTREME"
+            else if ob_low <= decisional_bullish_top and ob_high >= decisional_bullish_bottom
+                ob_type := "DECISIONAL"
+        else
+            if ob_high >= extreme_bearish_level
+                ob_type := "EXTREME"
+            else if ob_high >= decisional_bearish_bottom and ob_low <= decisional_bearish_top
+                ob_type := "DECISIONAL"
+    ob_type
+
+f_is_trading_day() =>
+    is_allowed_day = switch dayofweek
+        dayofweek.monday    => trade_monday
+        dayofweek.tuesday   => trade_tuesday
+        dayofweek.wednesday => trade_wednesday
+        dayofweek.thursday  => trade_thursday
+        dayofweek.friday    => trade_friday
+        => false
+    is_first_friday = dayofweek == dayofweek.friday and dayofmonth <= 7
+    is_allowed_day and not (avoid_first_friday and is_first_friday)
+
+f_get_line_style(style_str) =>
+    style_str == "Sólido" ? line.style_solid : style_str == "Discontinuo" ? line.style_dashed : line.style_dotted
+
+
+// ====================================================================================================================================================================================
+// ||                                                                                                                                                                                  ||
+// || MÓDULO 3: OBTENCIÓN DE DATOS                                                                                       ||
+// ||                                                                                                                                                                                  ||
+// ====================================================================================================================================================================================
+
+[o_h4, h_h4, l_h4, c_h4] = get_ohlc("240", instrument)
+[o_h1, h_h1, l_h1, c_h1] = get_ohlc("60", instrument)
+[o_m30, h_m30, l_m30, c_m30] = get_ohlc("30", instrument)
+[o_m20, h_m20, l_m20, c_m20] = get_ohlc("20", instrument)
+[o_m15, h_m15, l_m15, c_m15] = get_ohlc("15", instrument)
+[o_m10, h_m10, l_m10, c_m10] = get_ohlc("10", instrument)
+[o_m5, h_m5, l_m5, c_m5] = get_ohlc("5", instrument)
+[o_m3, h_m3, l_m3, c_m3] = get_ohlc("3", instrument)
+[o_m1, h_m1, l_m1, c_m1] = get_ohlc("1", instrument)
+string trend_res = trend_timeframe_input == "H1" ? "60" : "30"
+[o_trend, h_trend, l_trend, c_trend] = get_ohlc(trend_res, instrument)
+string choch_tf_res = choch_timeframe == "M1" ? "1" : "5"
+[swing_low_ltf, swing_high_ltf] = request.security(syminfo.tickerid, choch_tf_res, [ta.lowest(low, 100), ta.highest(high, 100)])
+
+
+// ====================================================================================================================================================================================
+// ||                                                                                                                                                                                  ||
+// || MÓDULO 4: CÁLCULO DE FILTROS                                                                                       ||
+// ||                                                                                                                                                                                  ||
+// ====================================================================================================================================================================================
+
+int trend_score = 0
+if use_mtf_alignment_filter
+    ema_h1_trend = ta.ema(c_h1, 50)
+    ema_m15_trend = ta.ema(c_m15, 50)
+    ema_m5_trend = ta.ema(c_m5, 50)
+    if c_h1 > ema_h1_trend
+        trend_score += 2
+    if c_m15 > ema_m15_trend
+        trend_score += 1
+    if c_m5 > ema_m5_trend
+        trend_score += 1
+    if c_h1 < ema_h1_trend
+        trend_score -= 2
+    if c_m15 < ema_m15_trend
+        trend_score -= 1
+    if c_m5 < ema_m5_trend
+        trend_score -= 1
+
+int trend_pivot_left = 5, int trend_pivot_right = 5
+float trend_ph = ta.pivothigh(h_trend, trend_pivot_left, trend_pivot_right)
+float trend_pl = ta.pivotlow(l_trend, trend_pivot_left, trend_pivot_right)
+var float last_swing_high = na, var float last_swing_low = na
+if not na(trend_ph)
+    last_swing_high := trend_ph
+if not na(trend_pl)
+    last_swing_low := trend_pl
+bool trend_is_bullish = c_trend > last_swing_low and h_trend > last_swing_high
+bool trend_is_bearish = c_trend < last_swing_high and l_trend < last_swing_low
+
+// --- NUEVO FILTRO: Sesgo Estructural H4 ---
+float h4_ph = ta.pivothigh(h_h4, 5, 5)
+float h4_pl = ta.pivotlow(l_h4, 5, 5)
+var float h4_last_swing_high = na, var float h4_last_swing_low = na
+if not na(h4_ph)
+    h4_last_swing_high := h4_ph
+if not na(h4_pl)
+    h4_last_swing_low := h4_pl
+bool h4_trend_is_bullish = c_h4 > h4_last_swing_low and h_h4 > h4_last_swing_high
+bool h4_trend_is_bearish = c_h4 < h4_last_swing_high and l_h4 < h4_last_swing_low
+
+
+// ====================================================================================================================================================================================
+// ||                                                                                                                                                                                  ||
+// || MÓDULO 5: DETECCIÓN Y FILTRADO DE ZONAS (POIs)                                                                    ||
+// ||                                                                                                                                                                                  ||
+// ====================================================================================================================================================================================
+
+var master_active_obs = array.new<OrderBlockData>()
+
+add_to_master_array(ob) =>
+    bool should_add = true
+    if array.size(master_active_obs) > 0
+        if array.get(master_active_obs, array.size(master_active_obs) - 1).ob_open == ob.ob_open
+            should_add := false
+    if should_add
+        array.push(master_active_obs, ob)
+
+detect_ob_on_tf(use_tf, tf_res, tf_label, o, h, l, c) =>
+    if use_tf and ta.change(time(tf_res))
+        bool is_bull_orig = f_is_bullish_ob(o[1], c[1])
+        bool is_bear_orig = f_is_bearish_ob(o[1], c[1])
+        if is_bull_orig or is_bear_orig
+            add_to_master_array(OrderBlockData.new(o[1], h[1], l[1], c[1], is_bull_orig, tf_label, bar_index))
+
+detect_ob_on_tf(use_h1_ob, "60", "H1", o_h1, h_h1, l_h1, c_h1)
+detect_ob_on_tf(use_m30_ob, "30", "M30", o_m30, h_m30, l_m30, c_m30)
+detect_ob_on_tf(use_m20_ob, "20", "M20", o_m20, h_m20, l_m20, c_m20)
+detect_ob_on_tf(use_m15_ob, "15", "M15", o_m15, h_m15, l_m15, c_m15)
+detect_ob_on_tf(use_m10_ob, "10", "M10", o_m10, h_m10, l_m10, c_m10)
+detect_ob_on_tf(use_m5_ob, "5", "M5", o_m5, h_m5, l_m5, c_m5)
+detect_ob_on_tf(use_m3_ob, "3", "M3", o_m3, h_m3, l_m3, c_m3)
+
+if array.size(master_active_obs) > 0
+    for i = array.size(master_active_obs) - 1 to 0
+        ob = array.get(master_active_obs, i)
+        if (ob.is_bullish and low < ob.ob_low) or (not ob.is_bullish and high > ob.ob_high)
+            array.remove(master_active_obs, i)
+
+var OrderBlockData closest_ob = na
+if array.size(master_active_obs) > 0
+    float min_distance = 1.0e18
+    closest_ob := na 
+    for i = 0 to array.size(master_active_obs) - 1
+        ob = array.get(master_active_obs, i)
+        string ob_type = f_get_ob_type(ob.is_bullish, ob.ob_low, ob.ob_high, last_swing_high, last_swing_low)
+        bool passes_filter = (ob_quality_filter == "Ambos" and (ob_type == "EXTREME" or ob_type == "DECISIONAL")) or (ob_quality_filter == "Solo Extremos" and ob_type == "EXTREME") or (ob_quality_filter == "Solo Decisionales" and ob_type == "DECISIONAL")
+        if passes_filter
+            distance = math.abs(close - (ob.is_bullish ? ob.ob_high : ob.ob_low))
+            if distance < min_distance
+                min_distance := distance, closest_ob := ob
+
+
+// ====================================================================================================================================================================================
+// ||                                                                                                                                                                                  ||
+// || MÓDULO 6: MÁQUINA DE ESTADOS Y GATILLO                                                                             ||
+// ||                                                                                                                                                                                  ||
+// ====================================================================================================================================================================================
+
+var bool is_monitoring = false
+var OrderBlockData ob_being_monitored = na
+var int bar_of_touch = na
+
+// Detección del Toque
+if not na(closest_ob) and strategy.position_size == 0 and not is_monitoring
+    bool trend_is_bullish_mtf = not use_mtf_alignment_filter or trend_score >= min_trend_score
+    bool trend_is_bearish_mtf = not use_mtf_alignment_filter or trend_score <= -min_trend_score
+    
+    bool final_trend_is_bullish = trend_is_bullish_mtf and (not use_h4_structural_bias or h4_trend_is_bullish)
+    bool final_trend_is_bearish = trend_is_bearish_mtf and (not use_h4_structural_bias or h4_trend_is_bearish)
+
+    // --> LÓGICA DE BARRIDO DE LIQUIDEZ Y CONDICIÓN DE MONITOREO MODIFICADA
+    bool bullish_sweep = low < ta.lowest(low, liquidity_lookback)[1]
+    bool bearish_sweep = high > ta.highest(high, liquidity_lookback)[1]
+
+    bool can_monitor_long = closest_ob.is_bullish and low <= closest_ob.ob_high and high >= closest_ob.ob_low and final_trend_is_bullish and (not use_liquidity_sweep_filter or bullish_sweep)
+    bool can_monitor_short = not closest_ob.is_bullish and high >= closest_ob.ob_low and low <= closest_ob.ob_high and final_trend_is_bearish and (not use_liquidity_sweep_filter or bearish_sweep)
+    
+    if can_monitor_long or can_monitor_short
+        is_monitoring := true
+        ob_being_monitored := closest_ob
+        bar_of_touch := bar_index
+
+// Confirmación y Gatillo
+bool final_long = false, bool final_short = false
+var float sl_price_final = na, var float entry_price_order = na
+
+if is_monitoring
+    [choch_o, choch_h, choch_l, choch_c] = get_ohlc(choch_tf_res, instrument)
+    bool choch_bullish = ta.cross(choch_c, ta.highest(choch_h, choch_lookback_bars)[1])
+    bool choch_bearish = ta.cross(choch_c, ta.lowest(choch_l, choch_lookback_bars)[1])
+
+    if not na(ob_being_monitored) and ob_being_monitored.is_bullish and choch_bullish and not na(swing_low_ltf)
+        if entry_type == "FVG"
+            if choch_l > choch_h[2]
+                entry_price_order := choch_h[2]
+                final_long := true
+        else // Fibonacci
+            entry_price_order := swing_high_ltf - (swing_high_ltf - swing_low_ltf) * fib_retracement_level
+            final_long := true
+        
+        if final_long
+            sl_price_final := swing_low_ltf - syminfo.mintick
+            is_monitoring := false
+
+    if not na(ob_being_monitored) and not ob_being_monitored.is_bullish and choch_bearish and not na(swing_high_ltf)
+        if entry_type == "FVG"
+            if choch_h < choch_l[2]
+                entry_price_order := choch_l[2]
+                final_short := true
+        else // Fibonacci
+            entry_price_order := swing_low_ltf + (swing_high_ltf - swing_low_ltf) * fib_retracement_level
+            final_short := true
+
+        if final_short
+            sl_price_final := swing_high_ltf + syminfo.mintick
+            is_monitoring := false
+
+    if is_monitoring and bar_index > bar_of_touch + choch_waiting_bars
+        is_monitoring := false
+
+// ====================================================================================================================================================================================
+// ||                                                                                                                                                                                  ||
+// || MÓDULO 7: GESTIÓN DE ÓRDENES                                                                                       ||
+// ||                                                                                                                                                                                  ||
+// ====================================================================================================================================================================================
+
+var float trade_entry_price = na, var float initial_sl = na, var float initial_risk = na
+bool is_trading_session = f_is_within_time()
+bool is_valid_day = f_is_trading_day()
+bool can_trade = is_trading_session and is_valid_day
+
+if (final_long or final_short) and strategy.position_size == 0 and not na(sl_price_final) and can_trade
+    string entry_id = final_long ? "OB " + ob_being_monitored.timeframe_name + " Demanda" : "OB " + ob_being_monitored.timeframe_name + " Oferta"
+    float risk = math.abs(entry_price_order - sl_price_final)
+    if risk > 0
+        float qty = (strategy.equity * risk_per_trade_perc / 100) / risk
+        strategy.entry(entry_id, final_long ? strategy.long : strategy.short, qty=qty, limit=entry_price_order)
+
+if strategy.position_size != 0
+    if na(trade_entry_price) 
+        trade_entry_price := strategy.position_avg_price
+        initial_sl := sl_price_final
+        initial_risk := math.abs(trade_entry_price - initial_sl)
+    float take_profit = na
+    if not na(initial_risk)
+        take_profit := strategy.position_size > 0 ? trade_entry_price + initial_risk * risk_reward_ratio : trade_entry_price - initial_risk * risk_reward_ratio
+    strategy.exit("Salida", stop=initial_sl, limit=take_profit)
+else 
+    trade_entry_price := na
+
+
+// ====================================================================================================================================================================================
+// ||                                                                                                                                                                                  ||
+// || MÓDULO 8: VISUALIZACIÓN EN TIEMPO REAL                                                                             ||
+// ||                                                                                                                                                                                  ||
+// ====================================================================================================================================================================================
+
+var table trade_info_table = na
+var line entry_line = na, var line sl_line = na, var line tp_line = na
+
+var float pending_entry = na
+var float pending_sl = na
+var float pending_tp = na
+var string pending_ob_tf = ''
+var string pending_trade_type = ''
+var bool pending_choch_confirmed = false
+var float pending_sl_pips = na
+
+// --- Lógica de la "Pizarra" ---
+// 1. Anotar en la pizarra cuando se confirma la señal
+if (final_long or final_short) and not na(entry_price_order) and not na(sl_price_final)
+    pending_entry := entry_price_order
+    pending_sl := sl_price_final
+    pending_tp := final_long ? entry_price_order + math.abs(entry_price_order - sl_price_final) * risk_reward_ratio : entry_price_order - math.abs(entry_price_order - sl_price_final) * risk_reward_ratio
+    pending_ob_tf := ob_being_monitored.timeframe_name
+    pending_trade_type := final_long ? "Demanda" : "Oferta"
+    pending_sl_pips := math.abs(entry_price_order - sl_price_final) / syminfo.mintick
+    pending_choch_confirmed := true
+
+// 2. Borrar la pizarra cuando la operación se cierra o se invalida
+if (strategy.position_size == 0 and strategy.position_size[1] != 0) or (is_monitoring == false and is_monitoring[1] == true)
+    pending_entry := na
+
+// --- Lógica de Dibujo (se ejecuta en cada barra) ---
+if show_live_visuals
+    // Gestionar la TABLA
+    if not na(pending_entry)
+        if na(trade_info_table)
+            trade_info_table := table.new(position.bottom_right, 7, 2, border_width=1)
+        
+        table.clear(trade_info_table, 0, 0, 6, 1)
+        
+        // Encabezados
+        table.cell(trade_info_table, 0, 0, "OB TF", text_color=color.black, bgcolor=color.new(color.gray, 50))
+        table.cell(trade_info_table, 1, 0, "Tipo", text_color=color.black, bgcolor=color.new(color.gray, 50))
+        table.cell(trade_info_table, 2, 0, "CHOCH", text_color=color.black, bgcolor=color.new(color.orange, 50))
+        table.cell(trade_info_table, 3, 0, "Entrada", text_color=color.black, bgcolor=color.new(color.blue, 80))
+        table.cell(trade_info_table, 4, 0, "Stop Loss", text_color=color.black, bgcolor=color.new(color.red, 80))
+        table.cell(trade_info_table, 5, 0, "Take Profit", text_color=color.black, bgcolor=color.new(color.green, 80))
+        table.cell(trade_info_table, 6, 0, "SL (Pips)", text_color=color.black, bgcolor=color.new(color.orange, 80))
+        
+        // Datos
+        table.cell(trade_info_table, 0, 1, pending_ob_tf, text_color=color.black)
+        table.cell(trade_info_table, 1, 1, pending_trade_type, text_color=color.black)
+        table.cell(trade_info_table, 2, 1, pending_choch_confirmed ? "¡CONFIRMADO!" : "Esperando...", text_color=color.black)
+        table.cell(trade_info_table, 3, 1, str.tostring(pending_entry, format.mintick), text_color=color.black)
+        table.cell(trade_info_table, 4, 1, str.tostring(pending_sl, format.mintick), text_color=color.black)
+        table.cell(trade_info_table, 5, 1, str.tostring(pending_tp, format.mintick), text_color=color.black)
+        table.cell(trade_info_table, 6, 1, str.tostring(pending_sl_pips, '0.0'), text_color=color.black)
+    else
+        table.delete(trade_info_table)
+
+    // Gestionar las LÍNEAS
+    if not na(pending_entry) and (timeframe.period == "1" or timeframe.period == "60")
+        if na(entry_line)
+            entry_line := line.new(bar_index, pending_entry, bar_index + line_length_bars, pending_entry, color=line_color_entry, style=f_get_line_style(line_style_entry_str), width=line_width)
+            sl_line := line.new(bar_index, pending_sl, bar_index + line_length_bars, pending_sl, color=line_color_sl, style=f_get_line_style(line_style_sl_str), width=line_width)
+            tp_line := line.new(bar_index, pending_tp, bar_index + line_length_bars, pending_tp, color=line_color_tp, style=f_get_line_style(line_style_tp_str), width=line_width)
+        else
+            line.set_xy1(entry_line, bar_index, pending_entry)
+            line.set_x2(entry_line, bar_index + line_length_bars)
+            line.set_xy1(sl_line, bar_index, pending_sl)
+            line.set_x2(sl_line, bar_index + line_length_bars)
+            line.set_xy1(tp_line, bar_index, pending_tp)
+            line.set_x2(tp_line, bar_index + line_length_bars)
+    else
+        line.delete(entry_line)
+        line.delete(sl_line)
+        line.delete(tp_line)
