@@ -1,0 +1,391 @@
+//@version=5
+strategy("Estrategia SMC v21.1 (Motor 'Hunting Zone' Corregido)", overlay=true, initial_capital=200000, default_qty_type=strategy.cash)
+max_bars_back(time, 5000)
+
+// ====================================================================================================================================================================================
+// || MÓDULO 1: ENTRADAS (INPUTS)
+// ====================================================================================================================================================================================
+
+// --- Inputs Generales ---
+string visuals_group = "1. Visualización"
+bool show_debug_labels = input.bool(true, "Mostrar Etiquetas de Depuración?", group=visuals_group)
+bool show_live_visuals = input.bool(true, "Activar Modo en Tiempo Real?", group=visuals_group)
+
+// --- Inputs de Configuración Principal ---
+string main_config_group = "3. Configuración Principal"
+string choch_timeframe = input.string("M1", "Temporalidad de Confirmación (CHOCH/Sweep)", options=["M1", "M5"], group = main_config_group)
+string trend_timeframe_input = input.string("H1", "Temporalidad de Tendencia Principal", options=["H1", "M30"], group = main_config_group)
+bool use_volume_confirmation = input.bool(true, "Activar Confirmación por Volumen?", group=main_config_group)
+int volume_ma_period = input.int(20, "Periodo MA de Volumen", minval=1, group=main_config_group)
+
+// --- Inputs para Gatillos de Entrada ---
+string entry_triggers_group = "4. Gatillos de Entrada"
+bool use_choch_trigger = input.bool(true, "Activar Gatillo por CHOCH Clásico?", group=entry_triggers_group)
+int choch_lookback_minutes = input.int(15, "   Periodo Búsqueda CHOCH (Minutos)", group=entry_triggers_group)
+string entry_type_fallback = input.string("50% del Impulso", "   Tipo de Entrada (si no hay FVG)", options=["Fibonacci", "50% del Impulso"], group=entry_triggers_group)
+float fib_retracement_level = input.float(0.62, "   Nivel de Retroceso Fibonacci", minval=0.2, maxval=0.8, step=0.01, group=entry_triggers_group)
+bool use_sweep_trigger = input.bool(true, "Activar Gatillo por Barrido de Liquidez?", group=entry_triggers_group)
+int sweep_pivot_lookback = input.int(5, "   Velas Izquierda/Derecha para Pivote de Barrido", group=entry_triggers_group)
+
+// --- Inputs para Selección de Temporalidades de OB ---
+string ob_timeframes_group = "2. Temporalidades de OB a Evaluar"
+bool use_h1_ob = input.bool(true, "Usar OB de H1", group=ob_timeframes_group)
+bool use_m30_ob = input.bool(true, "Usar OB de M30", group=ob_timeframes_group)
+bool use_m15_ob = input.bool(true, "Usar OB de M15", group=ob_timeframes_group)
+bool use_m5_ob = input.bool(true, "Usar OB de M5", group=ob_timeframes_group)
+
+// --- Inputs para Filtros de Calidad de OB ---
+string ob_quality_group = "10. Filtro de Calidad de OB"
+string ob_invalidation_method = input.string("Cierre", "Método de Invalidación de OB", options=["Mecha", "Cierre"], group=ob_quality_group)
+bool use_bos_filter = input.bool(false, "Activar Filtro de Break of Structure (BoS)?", group=ob_quality_group)
+
+// --- Inputs para Gestión de Riesgo y Filtros ---
+string risk_group = "6. Gestión de Riesgo y Filtros"
+string tp_type = input.string("Ratio R/R Fijo", "Tipo de Take Profit", options=["Ratio R/R Fijo", "Estructural"], group=risk_group)
+float risk_reward_ratio = input.float(2.0, "Ratio Riesgo/Beneficio (si el TP es Fijo)", minval=0.1, step=0.1, group=risk_group)
+float risk_per_trade_perc = input.float(0.5, "Riesgo por Operación (%)", minval=0.01, maxval=100, step=0.01, group=risk_group)
+bool use_breakeven = input.bool(true, "Activar Gestión a Break-Even?", group=risk_group)
+float breakeven_trigger_r = input.float(1.0, "Activar BE en (R)", step=0.1, group=risk_group)
+bool use_min_rr_filter = input.bool(true, "Activar Filtro de R/R Mínimo?", group=risk_group)
+float min_rr_ratio = input.float(2.0, "Ratio R/R Mínimo para Operar", group=risk_group, step=0.1)
+string time_session = input.session("0400-1200", "Horario de Operación (HHMM-HHMM)", group=risk_group)
+
+// ====================================================================================================================================================================================
+// || MÓDULO 2: TIPOS Y FUNCIONES BASE
+// ====================================================================================================================================================================================
+type OrderBlockData
+    float ob_open, float ob_high, float ob_low, float ob_close
+    bool is_bullish, string timeframe_name
+
+get_ohlc(res) => request.security(syminfo.tickerid, res, [open, high, low, close], lookahead=barmerge.lookahead_off)
+f_is_within_time() => not na(time(timeframe.period, time_session, "America/Argentina/Buenos_Aires"))
+f_is_bullish_ob(o, c) => c < o
+f_is_bearish_ob(o, c) => c > o
+f_has_imbalance(is_bull, h, l) => is_bull ? l[0] > h[2] : h[0] < l[2]
+
+f_caused_bos(is_bull, h, l) =>
+    last_pivot_h = ta.pivothigh(h, 5, 2)
+    last_pivot_l = ta.pivotlow(l, 5, 2)
+    float pivot_to_break = na
+    if is_bull
+        for i = 2 to 100
+            if not na(last_pivot_h[i])
+                pivot_to_break := last_pivot_h[i]
+                break // CORREGIDO
+    else
+        for i = 2 to 100
+            if not na(last_pivot_l[i])
+                pivot_to_break := last_pivot_l[i]
+                break // CORREGIDO
+    bool bos_confirmed = false
+    if not na(pivot_to_break)
+        if is_bull
+            bos_confirmed := h[0] > pivot_to_break
+        else
+            bos_confirmed := l[0] < pivot_to_break
+    bos_confirmed
+
+// ====================================================================================================================================================================================
+// || MÓDULO 3: DATOS Y VARIABLES DE ESTADO
+// ====================================================================================================================================================================================
+
+// --- Datos de Temporalidades ---
+string confirmation_tf_res = choch_timeframe == "M1" ? "1" : "5"
+string trend_tf_res = trend_timeframe_input == "H1" ? "60" : "30"
+
+[conf_o, conf_h, conf_l, conf_c, conf_v, conf_swing_low, conf_swing_high] = request.security(syminfo.tickerid, confirmation_tf_res, [open, high, low, close, volume, ta.lowest(low, 100), ta.highest(high, 100)])
+[o_trend, h_trend, l_trend, c_trend] = get_ohlc(trend_tf_res)
+
+[o_h1, h_h1, l_h1, c_h1] = get_ohlc("60")
+[o_m30, h_m30, l_m30, c_m30] = get_ohlc("30")
+[o_m15, h_m15, l_m15, c_m15] = get_ohlc("15")
+[o_m5, h_m5, l_m5, c_m5] = get_ohlc("5")
+
+// --- Variables de Tendencia ---
+var float last_swing_high = na, var float last_swing_low = na
+float trend_ph = ta.pivothigh(h_trend, 5, 5)
+float trend_pl = ta.pivotlow(l_trend, 5, 5)
+if not na(trend_ph)
+    last_swing_high := trend_ph
+if not na(trend_pl)
+    last_swing_low := trend_pl
+bool structure_is_bullish = c_trend > last_swing_low
+bool structure_is_bearish = c_trend < last_swing_high
+
+// --- NUEVA MÁQUINA DE ESTADOS: HUNTING ZONE ---
+var string hunt_direction = "none" // "none", "long", "short"
+var OrderBlockData active_hunt_zone_ob = na
+var string current_status = "Buscando OB"
+
+// --- Variables de Gestión de Órdenes ---
+var float entry_price_order = na
+var float sl_price_final = na
+var float active_trade_sl = na
+var bool is_order_pending = false
+
+// ====================================================================================================================================================================================
+// || MÓDULO 4: LÓGICA DE DETECCIÓN DE OB Y ZONAS DE CAZA
+// ====================================================================================================================================================================================
+
+var master_active_obs = array.new<OrderBlockData>()
+
+detect_ob_on_tf(use_tf, tf_res, tf_label, o, h, l, c) =>
+    if use_tf and ta.change(time(tf_res))
+        bool is_bull_orig = f_is_bullish_ob(o[1], c[1])
+        bool is_bear_orig = f_is_bearish_ob(o[1], c[1])
+        bool caused_bos = f_caused_bos(is_bull_orig, h, l)
+        if (is_bull_orig or is_bear_orig) and (use_bos_filter ? caused_bos : true)
+            array.push(master_active_obs, OrderBlockData.new(o[1], h[1], l[1], c[1], is_bull_orig, tf_label))
+
+detect_ob_on_tf(use_h1_ob, "60", "H1", o_h1, h_h1, l_h1, c_h1)
+detect_ob_on_tf(use_m30_ob, "30", "M30", o_m30, h_m30, l_m30, c_m30)
+detect_ob_on_tf(use_m15_ob, "15", "M15", o_m15, h_m15, l_m15, c_m15)
+detect_ob_on_tf(use_m5_ob, "5", "M5", o_m5, h_m5, l_m5, c_m5)
+
+// --- Lógica de Invalidación de OBs ---
+if array.size(master_active_obs) > 0
+    for i = array.size(master_active_obs) - 1 to 0
+        OrderBlockData ob = array.get(master_active_obs, i)
+        bool invalidated_by_wick = (ob.is_bullish and low < ob.ob_low) or (not ob.is_bullish and high > ob.ob_high)
+        bool invalidated_by_close = (ob.is_bullish and close < ob.ob_low) or (not ob.is_bullish and close > ob.ob_high)
+        if ob_invalidation_method == "Mecha" ? invalidated_by_wick : invalidated_by_close
+            array.remove(master_active_obs, i)
+
+// --- Selección del OB más cercano para activar la Zona de Caza ---
+var OrderBlockData chosen_ob = na
+chosen_ob := na
+if array.size(master_active_obs) > 0
+    float min_distance = 1.0e18
+    for i = 0 to array.size(master_active_obs) - 1
+        OrderBlockData ob = array.get(master_active_obs, i)
+        float distance = ob.is_bullish ? math.abs(close - ob.ob_high) : math.abs(close - ob.ob_low)
+        if distance < min_distance
+            min_distance := distance
+            chosen_ob := ob
+
+// --- Activación e Invalidación de la ZONA DE CAZA (HUNTING ZONE) ---
+if hunt_direction == "none" and not na(chosen_ob) and strategy.position_size == 0 and not is_order_pending
+    bool can_hunt_long = chosen_ob.is_bullish and low <= chosen_ob.ob_high and high >= chosen_ob.ob_low and structure_is_bullish
+    bool can_hunt_short = not chosen_ob.is_bullish and high >= chosen_ob.ob_low and low <= chosen_ob.ob_high and structure_is_bearish
+    if can_hunt_long
+        hunt_direction := "long"
+        active_hunt_zone_ob := chosen_ob
+        current_status := "Cazando Compras en " + chosen_ob.timeframe_name
+    if can_hunt_short
+        hunt_direction := "short"
+        active_hunt_zone_ob := chosen_ob
+        current_status := "Cazando Ventas en " + chosen_ob.timeframe_name
+
+// Si ya estamos cazando, verificamos si la zona fue invalidada por un CIERRE
+if hunt_direction != "none"
+    bool zone_invalidated = (hunt_direction == "long" and close < active_hunt_zone_ob.ob_low) or (hunt_direction == "short" and close > active_hunt_zone_ob.ob_high)
+    if zone_invalidated
+        hunt_direction := "none"
+        active_hunt_zone_ob := na
+        current_status := "Zona Invalidada"
+
+// ====================================================================================================================================================================================
+// || MÓDULO 5: LÓGICA DE GATILLOS DE ENTRADA
+// ====================================================================================================================================================================================
+
+// --- GATILLO 1: CHOCH CLÁSICO ---
+f_check_choch_trigger() =>
+    bool trigger_fired = false
+    float entry_price = na
+    float stop_loss = na
+    int lookback_bars = choch_timeframe == "M1" ? choch_lookback_minutes : int(choch_lookback_minutes / 5) 
+    bool choch_bullish = conf_c > ta.highest(conf_h, lookback_bars)[1]
+    bool choch_bearish = conf_c < ta.lowest(conf_l, lookback_bars)[1]
+    bool passes_volume = not use_volume_confirmation or conf_v > ta.sma(conf_v, volume_ma_period)
+
+    if hunt_direction == "long" and choch_bullish and passes_volume and not na(conf_swing_low)
+        if f_has_imbalance(true, conf_h, conf_l)
+            entry_price := conf_h[2]
+        else if entry_type_fallback == "Fibonacci"
+            entry_price := conf_swing_high - (conf_swing_high - conf_swing_low) * fib_retracement_level
+        else if entry_type_fallback == "50% del Impulso"
+            entry_price := conf_swing_low + (conf_swing_high - conf_swing_low) * 0.5
+        
+        if not na(entry_price)
+            trigger_fired := true
+            stop_loss := conf_swing_low - syminfo.mintick
+
+    if hunt_direction == "short" and choch_bearish and passes_volume and not na(conf_swing_high)
+        if f_has_imbalance(false, conf_h, conf_l)
+            entry_price := conf_l[2]
+        else if entry_type_fallback == "Fibonacci"
+            entry_price := conf_swing_low + (conf_swing_high - conf_swing_low) * fib_retracement_level
+        else if entry_type_fallback == "50% del Impulso"
+            entry_price := conf_swing_low + (conf_swing_high - conf_swing_low) * 0.5
+
+        if not na(entry_price)
+            trigger_fired := true
+            stop_loss := conf_swing_high + syminfo.mintick
+
+    [trigger_fired, entry_price, stop_loss]
+
+// --- GATILLO 2: BARRIDO DE LIQUIDEZ (LIQUIDITY SWEEP) ---
+f_check_liquidity_sweep_trigger() =>
+    bool trigger_fired = false
+    float entry_price = na
+    float stop_loss = na
+    float ltf_pivot_low = ta.pivotlow(conf_l, sweep_pivot_lookback, sweep_pivot_lookback)
+    float ltf_pivot_high = ta.pivothigh(conf_h, sweep_pivot_lookback, sweep_pivot_lookback)
+    bool passes_volume = not use_volume_confirmation or conf_v > ta.sma(conf_v, volume_ma_period)
+
+    if hunt_direction == "long" and not na(ltf_pivot_low) and passes_volume
+        bool swept_low = conf_l < ltf_pivot_low[1]
+        bool displacement_up = conf_c > conf_o and conf_c > ltf_pivot_low[1]
+        if swept_low and displacement_up
+            trigger_fired := true
+            entry_price := high // Entrar al cierre de la vela de la temporalidad del gráfico
+            stop_loss := conf_l - syminfo.mintick
+
+    if hunt_direction == "short" and not na(ltf_pivot_high) and passes_volume
+        bool swept_high = conf_h > ltf_pivot_high[1]
+        bool displacement_down = conf_c < conf_o and conf_c < ltf_pivot_high[1]
+        if swept_high and displacement_down
+            trigger_fired := true
+            entry_price := low // Entrar al cierre de la vela de la temporalidad del gráfico
+            stop_loss := conf_h + syminfo.mintick
+
+    [trigger_fired, entry_price, stop_loss]
+
+// --- LÓGICA DE EJECUCIÓN DE GATILLOS ---
+bool final_long = false
+bool final_short = false
+
+if hunt_direction != "none" and strategy.position_size == 0 and not is_order_pending
+    bool trigger_found = false
+    
+    // Prioridad 1: Barrido de Liquidez
+    if use_sweep_trigger and not trigger_found
+        [sweep_triggered, sweep_entry, sweep_sl] = f_check_liquidity_sweep_trigger()
+        if sweep_triggered
+            trigger_found := true
+            entry_price_order := sweep_entry
+            sl_price_final := sweep_sl
+            if hunt_direction == "long"
+                final_long := true
+            if hunt_direction == "short"
+                final_short := true
+
+    // Prioridad 2: CHOCH Clásico
+    if use_choch_trigger and not trigger_found
+        [choch_triggered, choch_entry, choch_sl] = f_check_choch_trigger()
+        if choch_triggered
+            trigger_found := true
+            entry_price_order := choch_entry
+            sl_price_final := choch_sl
+            if hunt_direction == "long"
+                final_long := true
+            if hunt_direction == "short"
+                final_short := true
+
+    // Si se encontró una entrada, reseteamos la zona de caza
+    if trigger_found
+        hunt_direction := "none"
+        active_hunt_zone_ob := na
+
+// ====================================================================================================================================================================================
+// || MÓDULO 6: GESTIÓN DE ÓRDENES
+// ====================================================================================================================================================================================
+// Resetear estado si una posición se cierra
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    is_order_pending := false
+    current_status := "Buscando OB"
+    active_trade_sl := na
+
+// Colocar la orden si se ha disparado un gatillo
+if (final_long or final_short) and strategy.position_size == 0 and not na(sl_price_final) and f_is_within_time()
+    float potential_tp = na
+    if tp_type == "Estructural"
+        if final_long and not na(last_swing_high)
+            potential_tp := last_swing_high
+        else if final_short and not na(last_swing_low)
+            potential_tp := last_swing_low
+    else
+        potential_tp := final_long ? entry_price_order + math.abs(entry_price_order - sl_price_final) * risk_reward_ratio : entry_price_order - math.abs(entry_price_order - sl_price_final) * risk_reward_ratio
+    
+    bool passes_rr_filter = not use_min_rr_filter or (not na(potential_tp) and (math.abs(potential_tp - entry_price_order) / math.abs(entry_price_order - sl_price_final)) >= min_rr_ratio)
+    
+    if passes_rr_filter
+        float risk_val = math.abs(entry_price_order - sl_price_final)
+        if risk_val > 0
+            float qty = strategy.equity * risk_per_trade_perc / 100 / risk_val
+            if final_long
+                strategy.entry("Long Entry", strategy.long, qty=qty, limit=entry_price_order)
+            else
+                strategy.entry("Short Entry", strategy.short, qty=qty, limit=entry_price_order)
+            is_order_pending := true
+            current_status := "Orden Pendiente"
+            active_trade_sl := sl_price_final
+
+// Gestionar la posición abierta
+if strategy.position_size != 0
+    current_status := "En Posición"
+    float take_profit_level = na
+    float stop_loss_level = active_trade_sl
+    float initial_risk = math.abs(strategy.position_avg_price - active_trade_sl)
+    
+    if tp_type == "Estructural"
+        if strategy.position_size > 0 and not na(last_swing_high)
+            take_profit_level := last_swing_high
+        else if strategy.position_size < 0 and not na(last_swing_low)
+            take_profit_level := last_swing_low
+    else // Ratio R/R Fijo
+        if initial_risk > 0
+            if strategy.position_size > 0
+                take_profit_level := strategy.position_avg_price + initial_risk * risk_reward_ratio
+            else
+                take_profit_level := strategy.position_avg_price - initial_risk * risk_reward_ratio
+            
+    if use_breakeven and initial_risk > 0
+        bool breakeven_hit = strategy.position_size > 0 ? high > strategy.position_avg_price + initial_risk * breakeven_trigger_r : low < strategy.position_avg_price - initial_risk * breakeven_trigger_r
+        if breakeven_hit
+            stop_loss_level := strategy.position_avg_price
+
+    strategy.exit("Exit", stop=stop_loss_level, limit=take_profit_level)
+
+// Cancelar orden pendiente si la zona se invalida
+if is_order_pending and hunt_direction == "none" and current_status == "Zona Invalidada"
+    strategy.cancel_all()
+    is_order_pending := false
+
+// ====================================================================================================================================================================================
+// || MÓDULO 7: VISUALIZACIÓN
+// ====================================================================================================================================================================================
+
+// --- Visualización de la Zona de Caza (Hunting Zone) ---
+var box hunt_zone_box = na
+if hunt_direction != "none" and not na(active_hunt_zone_ob)
+    color box_color = hunt_direction == "long" ? color.new(color.green, 85) : color.new(color.red, 85)
+    if na(hunt_zone_box)
+        hunt_zone_box := box.new(bar_index, active_hunt_zone_ob.ob_high, bar_index + 1, active_hunt_zone_ob.ob_low, border_color=na, bgcolor=box_color)
+    else
+        box.set_right(hunt_zone_box, bar_index + 1)
+else
+    box.delete(hunt_zone_box)
+    hunt_zone_box := na
+
+// --- Visualización de la tabla de estado ---
+if show_live_visuals
+    var table status_table = table.new(position.top_right, 2, 1, border_width=1)
+    table.cell(status_table, 0, 0, "Estado Actual", bgcolor=color.new(color.gray, 80))
+    table.cell(status_table, 1, 0, current_status, bgcolor=color.new(color.yellow, 80))
+
+// --- Visualización de etiquetas de depuración ---
+if show_debug_labels
+    var label debug_label = na
+    string debug_text = "ESTADO: " + current_status +
+     "\nDirección de Caza: " + hunt_direction +
+     "\nOBs Activos: " + str.tostring(array.size(master_active_obs)) +
+     "\nOB Elegido: " + (not na(chosen_ob) ? chosen_ob.timeframe_name : "Ninguno") +
+     "\n--- TENDENCIA " + trend_timeframe_input + " ---" +
+     "\nÚltimo Mínimo: " + str.tostring(last_swing_low, format.mintick) +
+     "\nÚltimo Máximo: " + str.tostring(last_swing_high, format.mintick)
+    if na(debug_label)
+        debug_label := label.new(bar_index, high, debug_text, xloc=xloc.bar_index, yloc=yloc.price, color=color.new(color.black, 20), style=label.style_label_left, textcolor=color.white, size=size.normal, textalign=text.align_left)
+    else
+        label.set_xy(debug_label, bar_index, high)
+        label.set_text(debug_label, debug_text)
